@@ -1,4 +1,5 @@
 .idea/
+.claude/
 
 # macOS
 .DS_Store
@@ -35,6 +36,9 @@ dist/
 *.egg-info/
 *.egg
 *.log
+.scrape-run/
+scraping/elementvape_browser_staging/
+*.jsonl
 *.pot
 *.pyc
 
@@ -90,6 +94,7 @@ htmlcov/
 .nox/
 .coverage
 .cache
+scraping/cache/
 nosetests.xml
 coverage.xml
 *.cover
@@ -111,4 +116,3 @@ coverage.xml
 ./datasets/output/processed_output/archive/
 ./datasets/output/raw_output/archive/
 *.csv
-

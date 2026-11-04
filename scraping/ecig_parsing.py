@@ -4,6 +4,7 @@
 
 import requests
 import re
+import json
 from bs4 import BeautifulSoup
 import time
 import csv
@@ -11,8 +12,14 @@ import pandas as pd
 from collections import Counter
 
 from PIL import Image
+try:
+    import pillow_avif  # noqa: F401  # Registers AVIF support with Pillow.
+except ImportError:
+    pillow_avif = None
 from io import BytesIO
 import os
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
@@ -25,6 +32,139 @@ import os
 
 # Load environment variables from .env file
 load_dotenv(os.path.join(os.getcwd(), ".env"))
+
+
+def prioritize_links(links):
+    """Order category URLs from highest to lowest project priority."""
+    def priority(link):
+        value = urlsplit(link).path.lower().replace("-", " ").replace("_", " ")
+        if any(term in value for term in ("new arrival", "newest", "new product", "new release", "new vapes")):
+            return -1
+        if any(term in value for term in ("thc", "delta 8", "delta 9", "delta 10")):
+            return 4
+        if any(term in value for term in ("disposable", "disposables", "puff", "nixodine")):
+            return 0
+        if any(term in value for term in (
+            "pod", "closed refill", "replacement cartridge", "cartridge", "prefilled",
+            "refillable vape", "pod system", "nicotine salt",
+        )):
+            return 1
+        if any(term in value for term in (
+            "e liquid", "eliquid", "e juice", "ejuice", "vape juice", "salt nic",
+        )):
+            return 2
+        return 3
+
+    return [link for _, link in sorted(enumerate(links), key=lambda item: (priority(item[1]), item[0]))]
+
+
+def extract_reviews(soup):
+    """Extract common JSON-LD and review-widget markup into the DB contract."""
+    reviews, seen = [], set()
+
+    def date_value(value):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date().isoformat() if value else None
+        except (TypeError, ValueError):
+            return None
+
+    def add(author, body, rating=None, date=None, verified=False, variant=None):
+        body = (body or "").strip()
+        if not body:
+            return
+        try:
+            rating = float(rating) if rating not in (None, "") else None
+        except (TypeError, ValueError):
+            rating = None
+        item = {"date": date_value(date), "author": (author or "").strip() or None,
+                "rating": rating, "verified_buyer": bool(verified),
+                "review_text": body, "variant": (variant or "").strip() or None}
+        key = (item["author"], item["review_text"], item["date"])
+        if key not in seen:
+            seen.add(key)
+            reviews.append(item)
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            values = json.loads(script.string or script.get_text())
+        except (TypeError, json.JSONDecodeError):
+            continue
+        values = values if isinstance(values, list) else [values]
+        for product in values:
+            if not isinstance(product, dict):
+                continue
+            product_reviews = product.get("review", [])
+            product_reviews = product_reviews if isinstance(product_reviews, list) else [product_reviews]
+            for review in product_reviews:
+                if not isinstance(review, dict):
+                    continue
+                author = review.get("author", {})
+                rating = review.get("reviewRating", {})
+                add(author.get("name") if isinstance(author, dict) else author,
+                    review.get("reviewBody"), rating.get("ratingValue") if isinstance(rating, dict) else rating,
+                    review.get("datePublished"))
+
+    for item in soup.select(".jdgm-rev[data-review-id], .yotpo-review, .reviews-item, .review-item, [data-review-id]"):
+        rating_node = item.select_one("[data-score], [data-rating], [data-review-rating], [aria-label*='star']")
+        rating = None
+        if rating_node:
+            rating = rating_node.get("data-score") or rating_node.get("data-rating") or rating_node.get("data-review-rating") or rating_node.get("aria-label")
+            match = re.search(r"\d+(?:\.\d+)?", str(rating)) if rating else None
+            rating = match.group(0) if match else None
+        author = item.select_one(".jdgm-rev__author, .yotpo-user-name, .review-author, .author, [data-review-author]")
+        body = item.select_one(".jdgm-rev__body, .yotpo-review-content, .review-text, .review-body, .detail, [data-review-text]")
+        date = item.select_one(".jdgm-rev__timestamp, .yotpo-review-date, .review-date, time, [data-review-date]")
+        variant = item.select_one(".jdgm-rev__prod-info, .review-variant, [data-review-variant]")
+        add(author.get_text(" ", strip=True) if author else None,
+            body.get_text(" ", strip=True) if body else None, rating,
+            (date.get("datetime") or date.get("data-review-date") or date.get_text(" ", strip=True)) if date else None,
+            item.get("data-verified-buyer") == "true" or bool(item.select_one(".verified, .verified-buyer")),
+            variant.get_text(" ", strip=True) if variant else None)
+    return reviews
+
+
+def normalize_site_category(value):
+    """Return a readable category without URL prefixes, slashes, or suffixes."""
+    category = (value or "").split("?", 1)[0].strip("/")
+    category = re.sub(r"^https?:--(?:www\.)?[^-]+-", "", category, flags=re.I)
+    category = re.sub(r"^https?--(?:www\.)?[^-]+-", "", category, flags=re.I)
+    category = re.sub(r"^collections-", "", category, flags=re.I)
+    category = re.sub(r"^https?://", "", category, flags=re.I)
+    category = re.sub(r"^(?:www\.)?[^/]+/", "", category, flags=re.I) if "://" not in category and "." in category.split("/", 1)[0] else category
+    for prefix in ("collections/", "product-category/", "category/", "brand/", "pages/"):
+        if category.lower().startswith(prefix):
+            category = category[len(prefix):]
+            break
+    category = category.replace("/", "-").replace("_", " ")
+    category = re.sub(r"\.html?$", "", category, flags=re.I)
+    return re.sub(r"\s+", " ", category).strip(" /-")
+
+
+def discover_catalog_links(html, base, prefixes=(), exclude=()):
+    """Extract and deduplicate internal catalog links from navigation HTML."""
+    soup = BeautifulSoup(html or "", "lxml")
+    found = []
+    seen = set()
+    excluded = tuple(value.lower() for value in exclude)
+    for link in soup.select("nav a[href], header a[href], .navPages a[href], a[href]"):
+        href = link.get("href", "").strip()
+        absolute = urljoin(base, href)
+        parts = urlsplit(absolute)
+        path = parts.path.rstrip("/")
+        lower = path.lower()
+        if not path or parts.netloc.lower() != urlsplit(base).netloc.lower():
+            continue
+        if any(value in lower for value in excluded):
+            continue
+        if "/products/" in lower or "/product/" in lower:
+            continue
+        if prefixes and not any(lower.startswith(prefix.lower()) for prefix in prefixes):
+            continue
+        canonical = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+        if canonical not in seen:
+            seen.add(canonical)
+            found.append(path)
+    return found
 
 section_strings_raw = {
     'Display Screen': 'screen',
@@ -840,7 +980,10 @@ def parse_description_sections(desc_section, all_headers, header_samples, full_l
 
 
 # Function to download and save an image
-def download_image(url, tag, save_dir='getpop_images', alt=''):
+MIN_IMAGE_BYTES = 10 * 1024
+
+
+def download_image(url, tag, save_dir='getpop_images', alt='', number_append=None, referer=None, cookies=None, allow_small=False):
     if not url:
         print("No URL provided for image download.")
         return None
@@ -850,6 +993,9 @@ def download_image(url, tag, save_dir='getpop_images', alt=''):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:92.0) Gecko/20100101 Firefox/92.0'
     }
+    if referer:
+        headers['Referer'] = referer
+        headers['Accept'] = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
     image_info = dict()
     main_dir = os.getenv('BOX_DIR')
     final_dir = os.path.join(main_dir, save_dir)
@@ -857,18 +1003,21 @@ def download_image(url, tag, save_dir='getpop_images', alt=''):
     if not os.path.exists(final_dir):
         os.makedirs(final_dir)
     image_extension = url.split('.')[-1].split('?')[0].split(':')[0]  # Extract file extension from URL
+    if number_append is not None:
+        tag = f"{tag}_{number_append}"
     save_path = os.path.join(final_dir, f'{tag}.{image_extension}')
     # if os.path.exists(save_path):
     #     #print(f"File already exists at {save_path}. Skipping download.")
     #     return
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, cookies=cookies, timeout=45)
         response.raise_for_status()  # Check for request errors
+        if len(response.content) < MIN_IMAGE_BYTES and not allow_small:
+            return None
         img = Image.open(BytesIO(response.content))
 
         width, height = img.size
         if width < 100 or height < 100:
-            print(f"Image {url} is too small ({width}x{height}). Skipping.")
             return None
         img.save(save_path)
         image_info['url'] = url
@@ -879,6 +1028,42 @@ def download_image(url, tag, save_dir='getpop_images', alt=''):
         print(f"Failed to download {url}: {e}")
         return None
     return image_info
+
+
+def download_image_batch(images, tag, save_dir, referer=None, cookies=None):
+    """Download product images, retaining a small image only as a last resort."""
+    candidates = []
+    seen = set()
+    for image in images or []:
+        if isinstance(image, str):
+            image = {'url': image, 'alt': ''}
+        url = image.get('url') if image else None
+        if url and url not in seen:
+            seen.add(url)
+            candidates.append(image)
+
+    records = []
+    for number, image in enumerate(candidates, start=1):
+        saved = download_image(
+            image['url'], tag, save_dir=save_dir, alt=image.get('alt', ''),
+            number_append=number, referer=referer, cookies=cookies,
+        )
+        if saved:
+            records.append(saved)
+
+    if records or not candidates:
+        return records
+
+    # Every available candidate was under 10 KB, so retain the first one.
+    fallback = download_image(
+        candidates[0]['url'], tag, save_dir=save_dir, alt=candidates[0].get('alt', ''),
+        number_append=1, referer=referer, cookies=cookies, allow_small=True,
+    )
+    return [fallback] if fallback else []
+
+
+def download_image_records(images, tag, save_dir, referer=None, cookies=None):
+    return download_image_batch(images, tag, save_dir, referer=referer, cookies=cookies)
         
 puff_regex = re.compile(r'(?:puff(?:s?\s*count)?:\s*)?(\d+(?:,\d+)?(?:-\d+)?(?:k)?(?:[+]?))(?:\s*puffs?)', flags=re.IGNORECASE)
 nico_regex = re.compile(r'([1-9]\.[0-9]{1,2}|[1-9][0-9]|[0-9])\s*(?:%|mg/ml)', flags=re.IGNORECASE)
@@ -1016,4 +1201,3 @@ def features_to_cats(feats):
         fl1 = found_flavs[0]
         
     return disposable,recharge,battery,mesh,usb,adjustable,found_flavs
-
