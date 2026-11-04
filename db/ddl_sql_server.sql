@@ -39,6 +39,32 @@ CREATE TABLE OnlineTobaccoScrape.dbo.ecig_product (
 	CONSTRAINT ecig_product_unique UNIQUE (url)
 );
 
+-- A compact, tracker-independent record of retailer-facing product changes.
+-- HTML and plain_text are purposefully not stored here.
+CREATE TABLE OnlineTobaccoScrape.dbo.ecig_product_history (
+	id bigint IDENTITY(1,1) NOT NULL,
+	product_id int NOT NULL,
+	changed_fields nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,
+	product_name nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	description nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	site_category nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	package_contents nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	ingredients nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	eliquid_contents nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	puffs nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	coil nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	battery_text nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	power_level nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	nicotine_level_text nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	stock_status nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	features nvarchar(MAX) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	date_inserted datetime2 NOT NULL DEFAULT getdate(),
+	CONSTRAINT PK_ecig_product_history PRIMARY KEY (id),
+	CONSTRAINT FK_ecig_product_history_ProductId FOREIGN KEY (product_id) REFERENCES OnlineTobaccoScrape.dbo.ecig_product(id)
+);
+CREATE INDEX IX_ecig_product_history_product_date
+	ON OnlineTobaccoScrape.dbo.ecig_product_history (product_id, date_inserted DESC);
+
 
 -- OnlineTobaccoScrape.dbo.ecig_colors definition
 

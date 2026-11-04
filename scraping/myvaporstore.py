@@ -30,7 +30,14 @@ from ecig_parsing import *
 BASE = 'https://www.myvaporstore.com' 
 SITE = MY_VAPOR_STORE
 
-links = [  
+links = [
+    # Current top-level links from the MyVaporStore megamenu.
+    '/New-Arrivals-Vape-s/77.htm',
+    '/Shop-by-Brand-s/194.htm',
+    '/E-Cig-Starter-Kits-E-Cigarette-s/70.htm',
+    '/Accessories-s/207.htm',
+    '/Dry-Herb-Oil-Wax-Vaporizer-s/621.htm',
+    '/Vape-Clearance-Sale-s/398.htm',
       '/Disposable-Vapes-s/885.htm',
     '/Disposables-Prefilled-Carts-s/1116.htm',
     '/Sale-Disposables-s/1134.htm',
@@ -221,15 +228,21 @@ def get_options_by_keywords(root, keywords: List[str]) -> List[str]:
     return sorted(results)
 
 
-def get_html(url, clicked=True, closed=True, elements=True):
+def get_driver():
+    options = Options()
+    if os.environ.get("HEADLESS", "0").lower() not in {"0", "false", "no"}:
+        options.add_argument('--headless')
+    driver = webdriver.Firefox(options=options)
+    driver.set_page_load_timeout(120)
+    return driver
 
-    driver = None
+
+def get_html(url, clicked=True, closed=True, elements=True, driver=None):
+
+    owns_driver = driver is None
     try:
-        options = Options()
-        options.add_argument('--headless')  # Enable headless mode properly
-
-        # Start the WebDriver in headless mode
-        driver = webdriver.Firefox(options=options)
+        if owns_driver:
+            driver = get_driver()
         driver.get(url)
         last_n = 0
         hrefs = set()
@@ -243,8 +256,13 @@ def get_html(url, clicked=True, closed=True, elements=True):
         # wait.until(EC.visibility_of_element_located((By.CLASS_NAME, "modal-content")))
 
         if not clicked:
-            button = driver.find_element(By.XPATH, "//button[text()='I am 21+']")
-            button.click()
+            try:
+                button = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(., '21') or contains(., 'Yes')]")
+                ))
+                button.click()
+            except TimeoutException:
+                pass
 
         if not closed:
             wait = WebDriverWait(driver, 3)  # 10 seconds timeout
@@ -297,14 +315,46 @@ def get_html(url, clicked=True, closed=True, elements=True):
         print(ex)
         html = ''
     finally:
-        if driver:
-            driver.close()
+        if driver and owns_driver:
+            driver.quit()
     time.sleep(3)
 
 
     return html
 
+
+def download_product_images(soup, tag):
+    """Download gallery images so existing products can be backfilled."""
+    records = []
+    seen = set()
+    gallery = soup.select_one(
+        '[data-product-gallery], .product-gallery, .productView-images, '
+        '.w-100.pa2'
+    ) or soup
+    for image in gallery.select('img'):
+        src = image.get('data-zoom-image') or image.get('data-src') or image.get('src')
+        if not src and image.get('srcset'):
+            src = image['srcset'].split(',')[-1].strip().split(' ')[0]
+        if not src:
+            continue
+        src = requests.compat.urljoin(BASE, src)
+        if src in seen or src.startswith('data:') or 'logo' in src.lower():
+            continue
+        seen.add(src)
+        saved = download_image(
+            src,
+            tag,
+            save_dir=f'data_from_sites_v2/{SITE}_images',
+            alt=image.get('alt', ''),
+            number_append=len(records) + 1,
+            referer=BASE,
+        )
+        if saved:
+            records.append(saved)
+    return records
+
 if __name__ == "__main__":
+    """
     from collections import Counter
 
     product_list = list()
@@ -314,125 +364,148 @@ if __name__ == "__main__":
     
     has_header = False
     
+    driver = get_driver()
+    try:
+        homepage = requests.get(BASE, timeout=45)
+        discovered = discover_catalog_links(
+            homepage.text,
+            BASE,
+            prefixes=("/",),
+            exclude=("/cart", "/login", "/account", "/search", "/compare", "/blog", "/help"),
+        )
+        scrape_links = list(dict.fromkeys(links + discovered))
+        print(f"Discovered {len(discovered)} My Vapor Store catalog links; using {len(scrape_links)} total")
+        for top_level_link in prioritize_links(scrape_links):
+            page = 1
+            site_section = normalize_site_category(top_level_link)
+            while True:
+                url = f'{BASE}{top_level_link}?page={page}'
+                print(url)
 
-    for top_level_link in links:
-        page = 1
-        site_section = top_level_link.split('/')[1].split('-s')[0]  # Extract section name
-
-
-        while True:
-            url = f'{BASE}{top_level_link}?page={page}'
-            print(url)
-
-            if url in found:
-                reqtxt = found[url]
-            else:
-                reqtxt = get_html(url)
-                found[url] = reqtxt
+                if url in found:
+                    reqtxt = found[url]
+                else:
+                    reqtxt = get_html(url, driver=driver)
+                    found[url] = reqtxt
             #reqtxt = get_html(url)
-            soup = BeautifulSoup(reqtxt)
-            products = soup.find_all('div', {'class': 'pa2 w-100 pt2 ph2 pb3 ph3-ns pb4-ns tl'})
-            print(url, len(products))
+                soup = BeautifulSoup(reqtxt)
+                products = soup.select(
+                'div.pa2.w-100.pt2.ph2.pb3.ph3-ns.pb4-ns.tl, '
+                '[data-product-id], [data-product], .product-card'
+            )
+                print(url, len(products))
+                if not products and len(reqtxt) < 1000:
+                    print(f"My Vapor Store returned an empty/blocked page ({len(reqtxt)} bytes): {url}")
             
-            if len(products) == 0:
-                break
-            page += 1
+                if len(products) == 0:
+                    break
+                page += 1
 
-            for product_card in products:
-                if not isinstance(product_card, element.Tag):
-                    continue
+                for product_card in products:
+                    if not isinstance(product_card, element.Tag):
+                        continue
 
-                product_name = product_card.find('h4')
+                    product_name = product_card.find('h4')
                 if product_name:
                     title = product_name.get_text(strip=True)
                 
                 # Extract brand
-                brand_card = product_card.find('div', {'data-brand': True})
+                    brand_card = product_card.find('div', {'data-brand': True})
                 if brand_card:
                     brand = brand_card.get_text(strip=True)
 
-                tag = ''
-                product_link = product_card.find('a', href=True)
+                    tag = ''
+                    product_link = product_card.find('a', href=True)
                 if product_link:
                     product_url_path = product_link.get('href')
                     full_link = f'{BASE}{product_url_path}'
                     tag = product_url_path.split('/')[-1].split('.htm')[0]
 
-                if product_exists(MY_VAPOR_STORE, tag):
-                    print('EXISTS', tag)
-                    continue
-
                 # Extract pricing information
-                base_price = product_card.find('div', {'data-product-base-price': True})
+                    base_price = product_card.find('div', {'data-product-base-price': True})
                 if base_price:
                     price_text = base_price.get_text(strip=True)
                     reg_price_str = re.sub(r'[^\d.]', '', price_text)
                 
-                sale_price = product_card.find('div', {'data-product-sale-price': True})
+                    sale_price = product_card.find('div', {'data-product-sale-price': True})
                 if sale_price:
                     price_span = sale_price.find('span', class_='_dqivtj')
                     if price_span:
                         price_text = price_span.get_text(strip=True)
                         sale_price_str = re.sub(r'[^\d.]', '', price_text)
 
-                stock_status = product_card.find('strong', {'data-product-stock-status': True})
+                    product_id = get_product_id(MY_VAPOR_STORE, tag)
+                    if product_id:
+                        print('EXISTS', tag)
+                        image_records = download_product_images(
+                            BeautifulSoup(get_html(full_link, driver=driver), 'lxml'), tag
+                        )
+                        insert_product_images(product_id, image_records)
+                        insert_ecig_price(product_id, reg_price_str, sale_price_str)
+
+                    continue
+
+
+
+                    stock_status = product_card.find('strong', {'data-product-stock-status': True})
                 if stock_status:
                     stock_status_str = stock_status.get_text(strip=True)
 
-                print(full_link)
+                    print(full_link)
 
-                if full_link in found:
-                    product_html = found[full_link]
-                else:
-                    product_html = get_html(full_link)
-                    found[full_link] = product_html
+                    if full_link in found:
+                        product_html = found[full_link]
+                    else:
+                        product_html = get_html(full_link, driver=driver)
+                        found[full_link] = product_html
 
-                psoup = BeautifulSoup(product_html)
-                txt = psoup.get_text()
+                    psoup = BeautifulSoup(product_html)
+                    txt = psoup.get_text()
 
-                main_element = psoup.find('div', class_='w-100 pa2')
-                if not main_element:
-                    print('NO MAIN ELEMENT', full_link)
-                    continue
+                    main_element = psoup.find('div', class_='w-100 pa2')
+                    if not main_element:
+                        print('NO MAIN ELEMENT', full_link)
+                        continue
 
-                flavor_list = get_options_by_keywords(main_element, ["flavor", "flavors", "flavor list", "available flavors"])
-                colors = get_options_by_keywords(main_element, ["color", "colors", "color list", "available colors"])
+                    flavor_list = get_options_by_keywords(main_element, ["flavor", "flavors", "flavor list", "available flavors"])
+                    colors = get_options_by_keywords(main_element, ["color", "colors", "color list", "available colors"])
 
-                nicotine_strengths = get_options_by_keywords(main_element, ["nicotine strength", "nicotine strengths", "nicotine level", "nicotine levels"])
-                bottle_sizes = get_options_by_keywords(main_element, ["bottle size", "bottle sizes", "size", "sizes", "ml", "milliliter", "milliliters"])
+                    nicotine_strengths = get_options_by_keywords(main_element, ["nicotine strength", "nicotine strengths", "nicotine level", "nicotine levels"])
+                    bottle_sizes = get_options_by_keywords(main_element, ["bottle size", "bottle sizes", "size", "sizes", "ml", "milliliter", "milliliters"])
                 
-                image_list = []
+                    image_list = []
 
                 # Find all <img> tags
-                for img in main_element.find_all("img"):
+                    for img in main_element.find_all("img"):
                     img_url = img.get("src")
                     img_alt = img.get("alt", "").strip()
                     if url:
                         image_list.append({"url": img_url, "alt": img_alt})
 
-                valid_image_list = []
-                img_n = 0
-                for i in image_list:
+                    valid_image_list = []
+                    img_n = 0
+                    for i in image_list:
                     img_n += 1
                     img_path = f'{tag}_{img_n}'
                     img = download_image(i['url'], img_path, save_dir=f'data_from_sites_v2/{SITE}_images', alt=i['alt'])
                     if img:
                         valid_image_list.append(img)
+                print(f'Downloaded {len(valid_image_list)}/{len(image_list)} images for {tag}')
 
                 # Look for description container
-                desc_elem = main_element.find(attrs={"data-clicktarget": "descriptionPosition"})
+                    desc_elem = main_element.find(attrs={"data-clicktarget": "descriptionPosition"})
 
-                description = ""
+                    description = ""
                 if desc_elem:
                     # Get all text without tags
                     description = desc_elem.get_text(separator=" ", strip=True)
 
 
-                warnings_text = ""
+                    warnings_text = ""
 
                 # Find the "Warnings" section
-                warnings_section = main_element.find("h4", string=lambda t: t and "Warnings" in t)
-                if warnings_section:
+                    warnings_section = main_element.find("h4", string=lambda t: t and "Warnings" in t)
+                    if warnings_section:
                     # The text is inside the next sibling div
                     parent_btn = warnings_section.find_parent("button")
                     if parent_btn:
@@ -440,11 +513,11 @@ if __name__ == "__main__":
                         if content_div:
                             warnings_text = content_div.get_text(separator=" ", strip=True)
 
-                features_specs = []
+                    features_specs = []
 
                 # Find the "Features and Specs" heading
-                features_heading = main_element.find("h5", string=lambda t: t and "Features and Specs" in t)
-                if features_heading:
+                    features_heading = main_element.find("h5", string=lambda t: t and "Features and Specs" in t)
+                    if features_heading:
                     # The <ul> with the list is right after the heading
                     ul = features_heading.find_next("ul")
                     if ul:
@@ -453,20 +526,20 @@ if __name__ == "__main__":
                             if text:
                                 features_specs.append(text)
 
-                package_contents = ""
+                    package_contents = ""
 
                 # Find the "Package Contents" heading
-                pkg_heading = main_element.find("h4", string=lambda t: t and "Package Contents" in t)
-                if pkg_heading:
+                    pkg_heading = main_element.find("h4", string=lambda t: t and "Package Contents" in t)
+                    if pkg_heading:
                     parent_btn = pkg_heading.find_parent("button")
                     if parent_btn:
                         content_div = parent_btn.find_next_sibling("div")
                         if content_div:
                             package_contents = content_div.get_text(separator=" ", strip=True)
-                reviews = []
+                    reviews = []
 
                 # Find review containers (adjust selector based on actual HTML structure)
-                for review in psoup.select('[data-product-review]'):
+                    for review in psoup.select('[data-product-review]'):
                     date = None
                     author = None
                     review_text = None
@@ -506,7 +579,7 @@ if __name__ == "__main__":
 
 
                 # Extracting product information
-                product_data = {
+                    product_data = {
                     'tag': tag,
                     "title": title,
                     "brand": brand,
@@ -540,22 +613,124 @@ if __name__ == "__main__":
 
                 feats = list()
                 #print(desc_fields)
-                feat = find_features(description)
-                any_found, puffs_res, nico_res, ml_res, flav_text, dev_text = feat
-                product_data['puffs'] = puffs_res
-                product_data['nicotine_strength'] = nico_res
-                product_data['eliquid_contents'] = ml_res
-                if any_found:
+                    feat = find_features(description)
+                    any_found, puffs_res, nico_res, ml_res, flav_text, dev_text = feat
+                    product_data['puffs'] = puffs_res
+                    product_data['nicotine_strength'] = nico_res
+                    product_data['eliquid_contents'] = ml_res
+                    if any_found:
                     #print(feat)
                     feats.append(feat)
-                disposable,recharge,battery,mesh,usb,adjustable,found_flavs = features_to_cats(feats)
-                product_data['disposable_bool'] = disposable
-                product_data['rechargeable_bool'] = recharge
-                product_data['battery_bool'] = battery
-                product_data['mesh_bool'] = mesh
-                product_data['usb_bool'] = usb
-                product_data['adjustable_bool'] = adjustable
+                    disposable,recharge,battery,mesh,usb,adjustable,found_flavs = features_to_cats(feats)
+                    product_data['disposable_bool'] = disposable
+                    product_data['rechargeable_bool'] = recharge
+                    product_data['battery_bool'] = battery
+                    product_data['mesh_bool'] = mesh
+                    product_data['usb_bool'] = usb
+                    product_data['adjustable_bool'] = adjustable
                 
-                print('MAP PRODUCT DATA', top_level_link, )
-                map_product_data(MY_VAPOR_STORE, product_data)
+                    print('MAP PRODUCT DATA', top_level_link, )
+                    map_product_data(MY_VAPOR_STORE, product_data)
+    finally:
+        driver.quit()
+    """
 
+    driver = get_driver()
+    try:
+        for top_level_link in links:
+            site_section = normalize_site_category(top_level_link)
+            page = 1
+            while True:
+                url = f'{BASE}{top_level_link}?page={page}'
+                print(url)
+                reqtxt = found.get(url) or get_html(url, driver=driver)
+                found[url] = reqtxt
+                soup = BeautifulSoup(reqtxt, 'lxml')
+                products = soup.select(
+                    'div.pa2.w-100.pt2.ph2.pb3.ph3-ns.pb4-ns.tl, '
+                    '[data-product-id], [data-product], .product-card'
+                )
+                print(url, len(products))
+                if not products:
+                    break
+
+                for product_card in products:
+                    product_link = product_card.find('a', href=True)
+                    title_node = product_card.find(['h4', 'h3', 'h2'])
+                    if not product_link or not title_node:
+                        continue
+                    product_url_path = product_link.get('href')
+                    full_link = requests.compat.urljoin(BASE, product_url_path)
+                    tag = product_url_path.split('/')[-1].split('.htm')[0]
+                    title = title_node.get_text(' ', strip=True)
+                    brand_node = product_card.find(attrs={'data-brand': True})
+                    brand = brand_node.get_text(' ', strip=True) if brand_node else ''
+                    price_node = product_card.find(attrs={'data-product-base-price': True})
+                    regular_price = re.sub(r'[^\d.]', '', price_node.get_text(strip=True)) if price_node else ''
+                    stock_node = product_card.find('strong', {'data-product-stock-status': True})
+                    stock_status = stock_node.get_text(strip=True) if stock_node else ''
+
+                    product_html = found.get(full_link) or get_html(full_link, driver=driver)
+                    found[full_link] = product_html
+                    product_soup = BeautifulSoup(product_html, 'lxml')
+                    main_element = product_soup.find('div', class_='w-100 pa2') or product_soup
+                    description = main_element.get_text(' ', strip=True)
+                    data = {
+                        'tag': tag,
+                        'title': title,
+                        'brand': brand,
+                        'link': full_link,
+                        'sale_price': None,
+                        'regular_price': regular_price,
+                        'flavor_list': [],
+                        'flavor_text': '',
+                        'color_list': [],
+                        'nicotine_strengths': [],
+                        'bottle_sizes': [],
+                        'stock_status': stock_status,
+                        'site_category': site_section,
+                        'images': [],
+                        'html': product_html,
+                        'plain_text': product_soup.get_text(' ', strip=True),
+                        'description': description,
+                        'sku': '',
+                        'nicotine_strength': '',
+                        'power_level': '',
+                        'battery': extract_battery(description),
+                        'coil': '',
+                        'puffs': '',
+                        'eliquid_contents': '',
+                        'warnings': '',
+                        'ingredients': '',
+                        'features': '',
+                        'package_contents': '',
+                        'reviews': extract_reviews(product_soup),
+                        'review_attributes': {},
+                    }
+                    any_found, puffs, nicotine, liquid, _, _ = find_features(description)
+                    data['puffs'] = puffs
+                    data['nicotine_strength'] = nicotine
+                    data['eliquid_contents'] = liquid
+                    data['images'] = download_product_images(product_soup, tag)
+                    print(f"Downloaded {len(data['images'])} images for {tag}")
+                    product_id = get_product_id(MY_VAPOR_STORE, tag)
+                    if product_id:
+                        print(f'EXISTS {tag}; recording price history')
+                        sync_ecig_product_history(product_id, data)
+                        update_ecig_product_metadata(product_id, stable_sku(MY_VAPOR_STORE, tag))
+                        reviews = extract_reviews(product_soup)
+                        print(f"REVIEWS {tag}: {len(reviews)} found" if reviews else f"REVIEWS {tag}: none found")
+                        if reviews:
+                            insert_reviews(reviews, product_id)
+                        if not product_has_images(product_id):
+                            insert_product_images(product_id, download_product_images(product_soup, tag))
+                        else:
+                            print(f"IMAGES EXIST for product_id {product_id}; skipping image download")
+                        insert_ecig_price(product_id, regular_price, None)
+                    else:
+                        print(f'NEW {tag}; inserting product and initial price history')
+                        print(f"REVIEWS {tag}: {len(data['reviews'])} found" if data["reviews"] else f"REVIEWS {tag}: none found")
+                        map_product_data(MY_VAPOR_STORE, data)
+                page += 1
+    finally:
+        driver.quit()

@@ -486,7 +486,7 @@ if __name__ == "__main__":
 
         for top_level_link in links:
             page = 1
-            site_section = top_level_link.replace('/collections/', '').split('?')[0]
+            site_section = normalize_site_category(top_level_link)
 
             url = f'{BASE}{top_level_link}'
             print('TOP LEVEL LINK', url)
@@ -574,6 +574,7 @@ if __name__ == "__main__":
                         # these seem to be the same
                         if img:
                             images.append(img)
+                    print(f'Downloaded {len(images)}/{len(img_urls)} images for {tag}')
 
 
                 flavors = extract_options(main, ["flavor", "flavors", "flavor list", "available flavors"])

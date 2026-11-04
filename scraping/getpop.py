@@ -37,60 +37,32 @@ BASE = 'https://getpop.co'
 company = GETPOP
 
 links = [
-     "/collections/disposables",
-    "/collections/disposables/hyde",
-    "/collections/disposables/fume",
-    "/collections/disposables/air-bar",
-    "/collections/disposables/hqd",
-    "/collections/disposables/geek-bar",
-    "/collections/disposables/lost-mary",
-    "/collections/disposables/kado-bar",
-    "/collections/disposables/raz",
-    "/collections/disposables/candy",
-    "/collections/disposables/coffee",
-    "/collections/disposables/fruity",
-    "/collections/disposables/ice",
-    "/collections/disposables/mint",
-    "/collections/disposables/tobacco",
-    "/collections/disposables/0mg-nicotine",
-    "/collections/disposables/rechargeable",
+    "/disposables/",
     
     # E-Liquids URLs
-    "/collections/e-liquids",
-    "/collections/e-liquids/Pod-Juice",
-    "/collections/e-liquids/VGOD",
-    "/collections/e-liquids/Monster-Vape-Labs",
-    "/collections/e-liquids/mint",
-    "/collections/e-liquids/fruity",
-    "/collections/e-liquids/tobacco",
-    "/collections/e-liquids/drinks%2Fbeverages",
-    "/collections/e-liquids/bakery",
+    "/e-liquids/",
     
     # Pod Systems URLs
-    "/collections/pod-systems",
-    "/collections/pod-systems/uwell",
-    "/collections/pod-systems/smok",
-    "/collections/pod-systems/vaporesso",
-    "/collections/pod-systems/voopoo",
-    "/collections/devices",
-    "/collections/pods",
+    "/pod-systems/",
+    "/devices/",
+    "/pods/",
     
     # Nicotine Pouches URLs
-    "/collections/nicotine-pouches",
-    "/collections/nicotine-pouches/zyn",
-    "/collections/nicotine-pouches/lucy",
-    "/collections/nicotine-pouches/kado-bar",
-    "/collections/nicotine-pouches/chyl",
-    "/collections/nicotine-pouches/fume",
-    "/collections/nicotine-pouches/qit",
+    "/nicotine-pouches/",
     
     # Shop By Collection URLs
-    "/collections/back-in-stock",
-    "/collections/new-arrivals",
-    "/collections/best-sellers",
-    "/collections/flavor-of-the-month",
-    "/collections/under-10",
-    "/collections/all"
+    "/back-in-stock/",
+    "/new-arrivals/",
+    "/best-sellers/",
+    "/flavor-of-the-month",
+    "/under-10/",
+    "/top-ten/top-ten-bakery/",
+    "/top-ten/top-ten-candy/",
+    "/top-ten/top-ten-fruity/",
+    "/top-ten/top-ten-icy-fruit/",
+    "/top-ten/top-ten-mint/",
+    "/top-ten/top-ten-tobacco/",
+    "/top-ten/top-ten-tropical/",
 ]
 
 print('TOTAL LINKS', len(links))
@@ -263,6 +235,41 @@ def convert_relative_time_to_date(relative_time):
     
     return date.strftime('%Y-%m-%d')
 
+
+def product_attributes(soup):
+    script = soup.find("script", string=re.compile(r"var\s+BCData\s*="))
+    if not script:
+        return {}
+    match = re.search(r"var\s+BCData\s*=\s*(\{.*?\});", script.string or "", re.S)
+    if not match:
+        return {}
+    try:
+        return json.loads(match.group(1)).get("product_attributes", {})
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def product_identifiers(soup, tag):
+    attributes = product_attributes(soup)
+    sku = attributes.get("sku")
+    unique_id = attributes.get("id") or attributes.get("product_id")
+    if not unique_id:
+        event_script = soup.find(string=re.compile(r'"product_id"'))
+        match = re.search(r'"product_id"\s*:\s*"?(\d+)', event_script or "")
+        unique_id = match.group(1) if match else None
+    return sku, str(unique_id or "") or None
+
+
+def product_stock_status(soup):
+    attributes = product_attributes(soup)
+    if attributes.get("instock") is True:
+        return "In Stock"
+    if attributes.get("instock") is False:
+        return "Out of Stock"
+    availability = soup.select_one('meta[property="og:availability"]')
+    value = (availability.get("content", "") if availability else "").lower()
+    return "In Stock" if value == "instock" else "Out of Stock" if value in {"oos", "outofstock"} else ""
+
 def get_html(url, timeout=120):  # Added timeout parameter
 
 
@@ -315,10 +322,18 @@ def main():
     
     with open(f'scraping/data-latest/{company}_scrape.csv', mode='w') as file:
         page = 1
-        for top_level_link in links:
+        homepage = requests.get(BASE, timeout=45)
+        discovered = discover_catalog_links(
+            homepage.text,
+            BASE,
+            exclude=("/cart", "/login", "/account", "/compare", "/wishlist", "/search", "/blog", "/pages/"),
+        )
+        scrape_links = list(dict.fromkeys(links + discovered))
+        print(f"Discovered {len(discovered)} Get Pop catalog links; using {len(scrape_links)} total")
+        for top_level_link in prioritize_links(scrape_links):
             
             page = 1
-            site_section = top_level_link.replace('/collections/', '')
+            site_section = normalize_site_category(top_level_link)
 
             while True:
                 url = f'{BASE}{top_level_link}?page={page}'
@@ -331,7 +346,7 @@ def main():
                     found[url] = reqtxt
                 #reqtxt = get_html(url)
                 soup = BeautifulSoup(reqtxt, features="lxml")
-                products = soup.find_all('div', {'class': 'product-card'})
+                products = soup.select('article.card, div.product-card')
                 print(url, len(products))
                 
                 if len(products) == 0:
@@ -341,16 +356,23 @@ def main():
                 for p in products:
                     if not isinstance(p, element.Tag):
                         continue
-                    title_ = p.find("h3", class_="product-card__title").text.strip()
-                    brand_ = p.find("p", class_="product-card__vendor").text.strip()
+                    title_node = p.select_one(".card-title, .product-card__title")
+                    if not title_node:
+                        continue
+                    title_ = title_node.get_text(" ", strip=True)
+                    brand_node = p.select_one('[data-test-info-type="brandName"], .product-card__vendor')
+                    brand_ = brand_node.get_text(" ", strip=True) if brand_node else ""
                     brand_ = brand_.replace('Vendor:', '').strip()
 
                     brand = None
                     title = f'{brand_} {title_}' 
                     print('TITLE', title)
 
-                    link = p.find("a", class_="reversed-link")['href']
-                    rpe = p.find("span", class_="f-price-item")
+                    link_node = p.select_one('a.reversed-link[href]') or p.select_one('a[href]')
+                    if not link_node:
+                        continue
+                    link = link_node['href']
+                    rpe = p.select_one("[data-product-price-without-tax], .f-price-item")
                     sale_price = None
                     if rpe:
                         reg_price = rpe.text.strip()
@@ -377,11 +399,11 @@ def main():
                     # else:
                     #     reg_price = None
 
-                    full_link = f'{BASE}{link}'
+                    full_link = requests.compat.urljoin(BASE, link)
 
                     img_urls = []
 
-                    tag = link.split('/')[-1]
+                    tag = link.rstrip('/').split('/')[-1].split('?')[0]
 
                     if full_link in found:
                         reqtxt = found[full_link]
@@ -392,20 +414,14 @@ def main():
                     print(full_link)
                     psoup = BeautifulSoup(reqtxt, features="lxml")
                     txt = psoup.get_text()
+                    sku, unique_id = product_identifiers(psoup, tag)
 
                     product_id = get_product_id(company, tag)
                     if product_id:
                         print('EXISTS', tag)
-                        reviews = extract_reviews(psoup)
-                        review_attributes = extract_flavor_ratings(psoup)
 
-                        insert_reviews(reviews, product_id)
-                        insert_review_attributes(review_attributes, product_id)
-
-                        continue
-
-                    thumbnails = psoup.find('div', class_='product__media-gallery-thumbails')
-                    gallery = psoup.find('div', class_='product__media-gallery-viewer-wrap')
+                    thumbnails = psoup.select_one('.productView-thumbnails, .product__media-gallery-thumbails')
+                    gallery = psoup.select_one('.productView-images, .product__media-gallery-viewer-wrap')
                     img_tags = list()
                     if thumbnails:
                         img_tags.append(thumbnails.find_all('img'))
@@ -448,7 +464,10 @@ def main():
                                     elif s.strip().startswith('//'):
                                         img_urls.append({'url':'http:' + s.strip(), 'alt': img_alt})
 
-                    container = psoup.find('div', {'class': 'product__blocks'})
+                    container = psoup.select_one('.productView-details.product-data, .product__blocks')
+                    description_container = psoup.select_one(
+                        '.productView-description, .product__blocks'
+                    )
                     flavors = []
                     colors = []
                     nicotine_strengths = []
@@ -463,12 +482,12 @@ def main():
             #             price = container.find('span', class_='price price--highlight').text.strip()
             #             compare_price = container.find('span', class_='price price--compare').text.strip()
 
-                        stock_status = ""
+                        stock_status = product_stock_status(psoup)
 
                         section_map = dict()
                         description_text = ''
                         # Extract product description
-                        highlights_div = container.find('div', class_='product__block--highlights-block')
+                        highlights_div = container.select_one('.product__block--highlights-block')
 
                         if highlights_div:
                             summary = highlights_div.find('h2')
@@ -483,7 +502,9 @@ def main():
                             description_text += '\n\n'
                             description_text = description_text.replace('HighlightsHighlights', 'Highlights ')
                         
-                        product_blocks = container.find_all('div', class_='product__block--collapsible_tab')
+                        product_blocks = (description_container or container).select(
+                            '.product__block--collapsible_tab, details'
+                        )
                         if product_blocks:
                             for p in product_blocks:
                                 summary = p.find('summary', class_='accordion-details__summary')
@@ -529,12 +550,8 @@ def main():
                     images = list()
                     for i in img_urls:
                         n += 1
-                        img = download_image(i['url'], tag, save_dir=f'data_from_sites_v2/{company}_images', alt=i['alt'])
-                        # these seem to be the same
-                        if img:
-                            images.append(img)
-                        else:
-                            print(f'Image {i["url"]} failed to download for {tag}')
+                        images.extend(download_image_batch([i], tag, f'data_from_sites_v2/{company}_images'))
+                    print(f'Downloaded {len(images)}/{len(img_urls)} images for {tag}')
 
 
                     reviews = extract_reviews(psoup)
@@ -556,6 +573,9 @@ def main():
                         'nicotine_strengths': nicotine_strengths,
                         'bottle_sizes': bottle_sizes,
                         "stock_status": stock_status,
+                        # Prefer the retailer SKU; fall back to the numeric
+                        # BigCommerce product ID, not the site tag.
+                        "sku": sku or unique_id or stable_sku(company, tag),
                         'site_category': site_section,
                         'images': images,
                         'html': reqtxt,
@@ -583,7 +603,14 @@ def main():
 
                     product_data['battery'] = extract_battery(desc_fields)
 
-                    map_product_data(company, product_data)
+                    if product_id:
+                        sync_ecig_product_history(product_id, product_data)
+                        update_ecig_product_metadata(product_id, sku or unique_id, stock_status)
+                        insert_reviews(reviews, product_id)
+                        insert_review_attributes(review_attributes, product_id)
+                        insert_ecig_price(product_id, reg_price, sale_price)
+                    else:
+                        map_product_data(company, product_data)
 
                     #print(product_data)
 

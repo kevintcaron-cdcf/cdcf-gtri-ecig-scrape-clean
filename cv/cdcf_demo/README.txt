@@ -30,8 +30,7 @@ This script requires you provide a few arguments
 -s is your starting index of images to be run (only 200 images can be run at once)
 -e is the ending index of images to be run (only 200 images can be run at once)
 
-ex: python google_gemini_predictuons.py -f vapewh_images -k AIzaSyA5Cb6-5MUkWnlZIDlLQQw2Kq3r1t0YayU -s 0 -e 100
-
+ex: python google_gemini_predictions.py -f vapewh_images -k "$GOOGLE_GEMINI_API_KEY" -s 0 -e 100
 
 
 

@@ -8,6 +8,7 @@ CV Updates
 
 
 * In our last meeting I showed some examples of incorrect predictions by the VLM due to various ambiguities in the prompt.
+	
 	* An example is the word cool or iced appears within the image but not in website description.
 * I made modifications to the prompt to specifically clear up these ambiguities and provide more specific instructions on making a determination. 
 * I also lowered the temperature parameter of the model, making it less creative and more consistent in its responses.

@@ -43,6 +43,14 @@ if __name__ == "__main__":
             sweet_level = r[6]
             iced_level = r[7]
             rating = r[8]
+            verified = r[9]
+            inserted = r[10]
+
+            if not verified:
+                continue
+
+            if not site == 'GETPOP':
+                continue
 
             while True:
                 tries = 0

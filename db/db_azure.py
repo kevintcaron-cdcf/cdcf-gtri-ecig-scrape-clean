@@ -2,6 +2,8 @@ import pyodbc
 from dotenv import load_dotenv
 import os
 import traceback
+import time
+import hashlib
 
 
 # Load environment variables from .env file
@@ -20,6 +22,8 @@ db_params = {
     'trust_server_certificate': 'no',  # Always 'no' for Azure SQL Database
     'connection_timeout': os.getenv('DB_CONNECTION_TIMEOUT', '30')
 }
+DB_CONNECT_RETRIES = 3
+DB_RETRY_DELAY = 2
 
 # Build connection string
 def get_connection_string():
@@ -36,15 +40,20 @@ def get_connection_string():
 
 # Function to connect to Azure SQL Database
 def connect():
-    """Connect to Azure SQL Database"""
-    try:
-        connection_string = get_connection_string()
-        conn = pyodbc.connect(connection_string)
-        return conn
-    except Exception as e:
-        print(f"Error connecting to Azure database: {e}")
-        traceback.print_exc()
-        raise
+    """Connect with bounded retries for transient connection exhaustion."""
+    connection_string = get_connection_string()
+    last_error = None
+    for attempt in range(DB_CONNECT_RETRIES):
+        try:
+            return pyodbc.connect(connection_string)
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < DB_CONNECT_RETRIES:
+                delay = DB_RETRY_DELAY * (2 ** attempt)
+                print(f"Azure connection failed; retrying in {delay}s ({attempt + 1}/{DB_CONNECT_RETRIES})")
+                time.sleep(delay)
+    print(f"Error connecting to Azure database after {DB_CONNECT_RETRIES} attempts: {last_error}")
+    raise last_error
 
 # sites
 CS_VAPE = "CS_VAPE"
@@ -55,8 +64,24 @@ VAPE_DOT_COM = "VAPE.COM"
 VAPE_SOURCING = "VAPE_SOURCING"
 VAPE_WH = "VAPE_WH"
 VAPING_DOT_COM = "VAPING.COM"
+VAPOR_DNA = "VAPOR_DNA"
+VAPORFI = "VAPORFI"
+ECIGMAFIA = "ECIGMAFIA"
 ELEMENT_VAPE = "ELEMENT_VAPE"
 MIPOD = "MIPOD"
+GOPUFF = "GOPUFF"
+HUFF_AND_PUFFERS = "HUFF_AND_PUFFERS"
+VAPE_JUICE_DEPOT = "VAPE_JUICE_DEPOT"
+PRILLA = "PRILLA"
+NICOKICK = "NICOKICK"
+NORTHERNER = "NORTHERNER"
+ALP_POUCH = "ALP_POUCH"
+SESH_PRODUCTS = "SESH_PRODUCTS"
+JUICE_HEAD = "JUICE_HEAD"
+OUTLAW_DIP = "OUTLAW_DIP"
+SPREE_BAR_SALES = "SPREE_BAR_SALES"
+WEST_COAST_VAPE_SUPPLY = "WEST_COAST_VAPE_SUPPLY"
+NIC_POUCHES_US = "NIC_POUCHES_US"
 
 
 def get_product_id(site_name, site_tag):
@@ -91,6 +116,187 @@ def get_product_id(site_name, site_tag):
     return val
 
 
+def update_ecig_product_metadata(product_id, sku=None, stock_status=None):
+    """Fill missing parsed metadata without replacing existing values."""
+    connection = None
+    cursor = None
+    try:
+        connection = connect()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE ecig_product
+            SET sku = COALESCE(NULLIF(sku, ''), ?),
+                stock_status = COALESCE(NULLIF(stock_status, ''), ?),
+                date_updated = GETDATE()
+            WHERE id = ?
+            """,
+            (sku, stock_status, product_id),
+        )
+        connection.commit()
+    except Exception as error:
+        print(f"Azure metadata update Error: {error}")
+        if connection:
+            connection.rollback()
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+PRODUCT_HISTORY_FIELDS = (
+    'product_name',
+    'description',
+    'site_category',
+    'package_contents',
+    'ingredients',
+    'eliquid_contents',
+    'puffs',
+    'coil',
+    'battery_text',
+    'power_level',
+    'nicotine_level_text',
+    'stock_status',
+    'features',
+)
+
+
+def _tracked_product_values(data):
+    """Map scraper output to the current product/history field names."""
+    return {
+        'product_name': data.get('title'),
+        'description': data.get('description'),
+        'site_category': data.get('site_category'),
+        'package_contents': data.get('package_contents'),
+        'ingredients': data.get('ingredients'),
+        'eliquid_contents': data.get('eliquid_contents'),
+        'puffs': data.get('puffs'),
+        'coil': data.get('coil'),
+        'battery_text': data.get('battery'),
+        'power_level': data.get('power_level'),
+        'nicotine_level_text': data.get('nicotine_strength'),
+        'stock_status': data.get('stock_status'),
+        'features': data.get('features'),
+    }
+
+
+def _comparable_product_value(value):
+    """Avoid a history row for whitespace-only scraper differences."""
+    return value.strip() if isinstance(value, str) else value
+
+
+def sync_ecig_product_history(product_id, data, cursor=None):
+    """Update tracked product fields and snapshot them when they change.
+
+    HTML and plain text are intentionally excluded.  Empty scraper values do
+    not replace an existing value, because a missing detail-page element is not
+    evidence that the retailer removed previously observed product metadata.
+    The caller can pass an existing cursor to keep this work in its transaction.
+    """
+    owns_connection = cursor is None
+    connection = None
+    product_tag = data.get('tag') or data.get('site_tag') or 'unknown-tag'
+    log_prefix = f"\t[{product_tag}] PRODUCT HISTORY"
+    try:
+        if owns_connection:
+            connection = connect()
+            cursor = connection.cursor()
+
+        field_list = ', '.join(PRODUCT_HISTORY_FIELDS)
+        cursor.execute(
+            f"SELECT {field_list} FROM ecig_product WHERE id = ?", (product_id,)
+        )
+        current_row = cursor.fetchone()
+        if not current_row:
+            return False
+        current = dict(zip(PRODUCT_HISTORY_FIELDS, current_row))
+        cursor.execute(
+            "SELECT TOP 1 id FROM ecig_product_history WHERE product_id = ?",
+            (product_id,),
+        )
+        has_history = cursor.fetchone() is not None
+        inserted_baseline = False
+        if not has_history:
+            # Existing products predate this table. Seed their current state on
+            # the first normal scrape so the next change has a prior snapshot.
+            insert_ecig_product_history_snapshot(cursor, product_id, current)
+            inserted_baseline = True
+            print(f"{log_prefix} baseline inserted for product_id {product_id}")
+        incoming = _tracked_product_values(data)
+
+        # Only update values the scraper actually found; stock status is also
+        # naturally handled because both In Stock and Out of Stock are nonempty.
+        proposed = current.copy()
+        changed_fields = []
+        for field, value in incoming.items():
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            value = _comparable_product_value(value)
+            if _comparable_product_value(current[field]) != value:
+                proposed[field] = value
+                changed_fields.append(field)
+
+        if not changed_fields:
+            if owns_connection and inserted_baseline:
+                connection.commit()
+            if not inserted_baseline:
+                print(f"{log_prefix} unchanged for product_id {product_id}")
+            return False
+
+        assignments = ', '.join(f"{field} = ?" for field in changed_fields)
+        cursor.execute(
+            f"UPDATE ecig_product SET {assignments}, date_updated = GETDATE() WHERE id = ?",
+            tuple(proposed[field] for field in changed_fields) + (product_id,),
+        )
+        history_fields = ', '.join(PRODUCT_HISTORY_FIELDS)
+        placeholders = ', '.join('?' for _ in PRODUCT_HISTORY_FIELDS)
+        cursor.execute(
+            f"""INSERT INTO ecig_product_history
+                (product_id, changed_fields, {history_fields})
+                VALUES (?, ?, {placeholders})""",
+            (product_id, ','.join(changed_fields))
+            + tuple(proposed[field] for field in PRODUCT_HISTORY_FIELDS),
+        )
+        if owns_connection:
+            connection.commit()
+        print(
+            f"{log_prefix} change inserted for product_id {product_id}: "
+            f"{', '.join(changed_fields)}"
+        )
+        return True
+    except Exception as error:
+        print(f"Azure product history sync Error: {error}")
+        if owns_connection and connection:
+            connection.rollback()
+        return False
+    finally:
+        if owns_connection:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+
+def insert_ecig_product_history_snapshot(cursor, product_id, product_data):
+    """Store the initial tracked-field snapshot for a newly inserted product."""
+    values = {field: product_data.get(field) for field in PRODUCT_HISTORY_FIELDS}
+    fields = ', '.join(PRODUCT_HISTORY_FIELDS)
+    placeholders = ', '.join('?' for _ in PRODUCT_HISTORY_FIELDS)
+    cursor.execute(
+        f"""INSERT INTO ecig_product_history
+            (product_id, changed_fields, {fields})
+            VALUES (?, ?, {placeholders})""",
+        (product_id, 'initial') + tuple(values[field] for field in PRODUCT_HISTORY_FIELDS),
+    )
+
+
+def stable_sku(site, site_tag):
+    """Return a deterministic fallback SKU when a retailer exposes no SKU."""
+    digest = hashlib.sha256(f"{site}:{site_tag}".encode("utf-8")).hexdigest()[:20]
+    return f"AUTO-{digest}"
+
+
 def product_exists(site_name, site_tag):
     connection = None
     cursor = None
@@ -120,96 +326,122 @@ def product_exists(site_name, site_tag):
 
 
 def map_product_data(site, data):
-    try:
+    for attempt in range(DB_CONNECT_RETRIES):
+        connection = None
+        cursor = None
+        try:
 
-        connection = connect()
-        cursor = connection.cursor()
+            connection = connect()
+            cursor = connection.cursor()
+    
+            product_data = {}
+    
+            product_data = {
+                'product_name': data.get('title', None),
+                'site_name': site,
+                'url': data.get('link', None),
+                'site_category': data.get('site_category', None),
+                'site_tag': data['tag'],
+                'sku': data.get('sku') or data.get('upc') or data.get('product_id') or stable_sku(site, data['tag']),
+                'brand': data.get('brand', None),
+                'html': data['html'],
+                'plain_text': data.get('plain_text', None),
+                'price': data.get('regular_price', None),
+                'price_sale': data.get('sale_price', None),
+                'flavor_text': data.get('flavor_text', None),
+                'description': data.get('description', None),
+                'package_contents': data.get('package_contents', None),
+                'features': data.get('features', None),
+                'ingredients': data.get('ingredients', None),
+                'warnings': data.get('warnings', None),
+                'eliquid_contents': data.get('eliquid_contents', None),
+                'puffs': data.get('puffs', None),
+                'coil': data.get('coil', None),
+                'battery_text': data.get('battery', None),
+                'power_level': data.get('power_level', None),
+                'nicotine_level_text': data.get('nicotine_strength', None),
+                'stock_status': data.get('stock_status', None),    
+            }  
+            # A partial insert can survive a driver/database failure even when
+            # the surrounding retry is rolled back. Avoid retrying the same
+            # unique URL and turning a recoverable write failure into a second
+            # unique-key error.
+            cursor.execute("SELECT TOP 1 id FROM ecig_product WHERE url = ?", (product_data['url'],))
+            existing_product = cursor.fetchone()
+            if existing_product:
+                print(f"Product URL already exists as product_id {existing_product[0]}; skipping duplicate insert")
+                connection.rollback()
+                return False
 
-        product_data = {}
-
-        product_data = {
-            'product_name': data.get('title', None),
-            'site_name': site,
-            'url': data.get('link', None),
-            'site_category': data.get('site_category', None),
-            'site_tag': data['tag'],
-            'sku': None,
-            'brand': data.get('brand', None),
-            'html': data['html'],
-            'plain_text': data.get('plain_text', None),
-            'price': data.get('regular_price', None),
-            'price_sale': data.get('sale_price', None),
-            'flavor_text': data.get('flavor_text', None),
-            'description': data.get('description', None),
-            'package_contents': data.get('package_contents', None),
-            'features': data.get('features', None),
-            'ingredients': data.get('ingredients', None),
-            'warnings': data.get('warnings', None),
-            'eliquid_contents': data.get('eliquid_contents', None),
-            'puffs': data.get('puffs', None),
-            'coil': data.get('coil', None),
-            'battery_text': data.get('battery', None),
-            'power_level': data.get('power_level', None),
-            'nicotine_level_text': data.get('nicotine_strength', None),
-            'stock_status': data.get('stock_status', None),    
-        }  
-        # Insert into ecig_product and get the product_id
-        product_id = insert_ecig_product(cursor, product_data)
-
-        # Insert into other tables
-        # insert_ecig_product_attributes(cursor, attributes_data)
-        if len(data.get('reviews', [])) > 0:
-            insert_reviews_to_db(data.get('reviews', []), product_id, cursor)
-
-        if len(data.get('review_attributes', {}).keys()) > 0:
-            insert_review_attributes_to_db(cursor, data.get('review_attributes', {}), product_id)
-        if len(data.get('flavor_list', [])) > 0:
-            for flavor in data.get('flavor_list', []):
-                flavor_data = {
-                    'product_id': product_id,
-                    'flavor_name': flavor.replace(' (out of stock)', '').strip(),
-                    'flavor_description': None,
-                    'flavor_category': None,
-                    'iced_bool': None,
-                    'cbd_bool': None,
-                }
-                insert_ecig_flavors(cursor, flavor_data)
-        if len(data.get('nicotine_strengths', [])) > 0:
-            for strength in data.get('nicotine_strengths', []):
-                if type(strength) is str:
-                    strength = {'value': strength, 'unit': None, 'level': None}
-                nicotine_level_data = {
-                    'product_id': product_id,
-                    'value': strength.get('value', None),
-                    'unit': strength.get('unit', None),
-                    'level': strength.get('level', None),
-                }
-                insert_ecig_nicotine_levels(cursor, nicotine_level_data)
-        if len(data.get('images', [])) > 0:
-            for image in data.get('images', []):
-                image_data = {
-                    'product_id': product_id,
-                    'url': image.get('url', None),
-                    'path': image.get('path', None),
-                    'title': image.get('title', None),
-                    'alt_text': image.get('alt', None),
-                }
-                insert_ecig_images(cursor, image_data)
-
-        # Commit the transaction
-        connection.commit()
-        print("Product inserted into Azure successfully!")
-
-    except Exception as error:
-        print(f"Azure map_product_data Error: {error}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
+            # Insert into ecig_product and get the product_id
+            product_id = insert_ecig_product(cursor, product_data)
+    
+            insert_ecig_price_to_db(cursor, product_id, product_data['price'], product_data['price_sale'])
+            insert_ecig_product_history_snapshot(cursor, product_id, product_data)
+    
+            # Insert into other tables
+            # insert_ecig_product_attributes(cursor, attributes_data)
+            if len(data.get('reviews', [])) > 0:
+                insert_reviews_to_db(data.get('reviews', []), product_id, cursor)
+    
+            if len(data.get('review_attributes', {}).keys()) > 0:
+                insert_review_attributes_to_db(cursor, data.get('review_attributes', {}), product_id)
+            if data.get('flavor_list'):
+                for flavor in data.get('flavor_list', []):
+                    if isinstance(flavor, str) and flavor.strip():
+                        flavor_data = {
+                            'product_id': product_id,
+                            'flavor_name': flavor.replace(' (out of stock)', '').strip(),
+                            'flavor_description': None,
+                            'flavor_category': None,
+                            'iced_bool': None,
+                            'cbd_bool': None,
+                        }
+                        insert_ecig_flavors(cursor, flavor_data)
+            if data.get('nicotine_strengths'):
+                for strength in data.get('nicotine_strengths', []):
+                    if isinstance(strength, str):
+                        strength = {'value': strength, 'unit': None, 'level': None}
+                    if not isinstance(strength, dict):
+                        continue
+                    nicotine_level_data = {
+                        'product_id': product_id,
+                        'value': strength.get('value'),
+                        'unit': strength.get('unit'),
+                        'level': strength.get('level'),
+                    }
+                    insert_ecig_nicotine_levels(cursor, nicotine_level_data)
+            if len(data.get('images', [])) > 0:
+                image_count = 0
+                for image in data.get('images', []):
+                    image_data = {
+                        'product_id': product_id,
+                        'url': image.get('url', None),
+                        'path': image.get('path', None),
+                        'title': image.get('title', None),
+                        'alt_text': image.get('alt', None),
+                    }
+                    if insert_ecig_images(cursor, image_data):
+                        image_count += 1
+                print(f"Downloaded/inserted {image_count} images for product_id {product_id}")
+    
+            # Commit the transaction
+            connection.commit()
+            print("Product inserted into Azure successfully!")
+            return True
+        
+        except Exception as error:
+            print(f"Azure map_product_data Error (attempt {attempt + 1}/{DB_CONNECT_RETRIES}): {error}")
+            if connection:
+                connection.rollback()
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+        if attempt + 1 < DB_CONNECT_RETRIES:
+            time.sleep(DB_RETRY_DELAY * (2 ** attempt))
+    return False
 
 def get_products(site_name):
     results = []
@@ -228,6 +460,35 @@ def get_products(site_name):
             THEN 2
             ELSE 3
             END, site_tag
+        """
+
+        # Execute the query with the site_name parameter
+        cursor.execute(query, (site_name, ))
+
+        # Fetch all the results
+        results = cursor.fetchall()
+    except Exception as error:
+        print(f"Azure get_products Error: {error}")
+        traceback.print_exc()
+        if connection:
+            connection.rollback()
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+    return results
+
+def get_products_and_descriptions(site_name):
+    results = []
+    try:
+        connection = connect()  # Use our connect() function
+        cursor = connection.cursor()
+
+        # The SQL query with a parameter placeholder for site_name
+        query = """
+       select ep.id as product_id, ep.product_name, ep.description, ep.site_tag from ecig_product ep 
+        where ep.site_name = ?
         """
 
         # Execute the query with the site_name parameter
@@ -359,7 +620,82 @@ def insert_review_attributes_to_db(cursor, review_attributes_dict, product_id):
     return inserted_ids
 
 
+def insert_ecig_price_to_db(cursor, product_id, price, price_sale):
+    """
+    Inserts a pricing record into the ecig_price table only if the 
+    price or sale price has changed from the most recent entry.
+    """
+    
+    # 1. Query the latest existing record for this product
+    check_sql = """
+        SELECT TOP 1 price, price_sale
+        FROM ecig_price
+        WHERE product_id = ?
+        ORDER BY id DESC
+    """
+    
+    try:
+        cursor.execute(check_sql, (product_id,))
+        latest_record = cursor.fetchone()
+        
+        # 2. Compare the latest record to the incoming values
+        if latest_record:
+            # pyodbc returns rows as tuples, e.g., ('19.99', None)
+            latest_price = latest_record[0]
+            latest_price_sale = latest_record[1]
+            
+            # If nothing has changed, skip the insert to save database space
+            if latest_price == price and latest_price_sale == price_sale:
+                print(f"Prices for product_id {product_id} are unchanged. Skipping insert.")
+                return 0 # Exit the function early
+
+        # 3. If we reach here, it's either a new product or a changed price
+        insert_sql = """
+            INSERT INTO ecig_price (product_id, price, price_sale)
+            VALUES (?, ?, ?)
+        """
+        
+        cursor.execute(insert_sql, (product_id, price, price_sale))
+        cursor.connection.commit()
+        
+        print(f"Successfully inserted new price record for product_id: {product_id}")
+
+        
+    except Exception as e:
+        cursor.connection.rollback()
+        print(f"Database operation failed: {e}")
+    
+    return 1
+
+def insert_ecig_price(product_id, price, price_sale): 
+    for attempt in range(DB_CONNECT_RETRIES):
+        cursor = None
+        connection = None
+        try:
+            connection = connect()
+            cursor = connection.cursor()
+            res = insert_ecig_price_to_db(cursor, product_id, price, price_sale)
+            if res == 1:
+                connection.commit()
+                print("Price data rows inserted into Azure!")
+            return True
+        except Exception as error:
+            print(f"Azure insert price Error (attempt {attempt + 1}/{DB_CONNECT_RETRIES}): {error}")
+            if connection:
+                connection.rollback()
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+        if attempt + 1 < DB_CONNECT_RETRIES:
+            time.sleep(DB_RETRY_DELAY * (2 ** attempt))
+    return False
+
+
 def insert_reviews(reviews, product_id): 
+    cursor = None
+    connection = None
     try:
         connection = connect()  # Use our connect() function
         cursor = connection.cursor()
@@ -367,7 +703,10 @@ def insert_reviews(reviews, product_id):
 
         # Commit the transaction
         connection.commit()
-        print(f"{len(rows)} Review data rows inserted into Azure!")
+        if len(rows) > 0:
+            print(f"{len(rows)} Review data rows inserted into Azure!")
+        else:
+            print(f"No new reviews to insert for product_id {product_id}.")
 
     except Exception as error:
         print(f"Azure insert_review_attributes Error: {error}")
@@ -564,7 +903,9 @@ def insert_ecig_product(cursor, product_data):
     )
     
     cursor.execute(query, params)
-    return cursor.fetchone()[0]
+    new_id = cursor.fetchone()[0]
+    print(f"Inserted product '{product_data['product_name']}' ({product_data['site_name']}) as product_id {new_id}")
+    return new_id
 
 def insert_ecig_product_attributes(cursor, attributes_data):
     query = """
@@ -606,7 +947,7 @@ def insert_ecig_flavors(cursor, flavors_data):
     
     cursor.execute(check_query, (flavors_data['product_id'], flavors_data['flavor_name']))
     existing_row = cursor.fetchone()
-    
+
     if existing_row:
         # Record already exists, add its ID to the list
         return
@@ -619,7 +960,7 @@ def insert_ecig_flavors(cursor, flavors_data):
             ?, ?, ?, ?, ?, ?
         );
     """
-    
+
     # Convert dictionary to tuple in the correct order
     params = (
         flavors_data['product_id'],
@@ -629,8 +970,9 @@ def insert_ecig_flavors(cursor, flavors_data):
         flavors_data['iced_bool'],
         flavors_data['cbd_bool']
     )
-    
+
     cursor.execute(query, params)
+    print(f"Inserted flavor '{flavors_data['flavor_name']}' for product_id {flavors_data['product_id']}")
 
 
 def insert_ecig_nicotine_levels(cursor, nicotine_levels_data):
@@ -655,15 +997,16 @@ def insert_ecig_nicotine_levels(cursor, nicotine_levels_data):
             ?, ?, ?
         );
     """
-    
+
     # Convert dictionary to tuple in the correct order
     params = (
         nicotine_levels_data['product_id'],
         nicotine_levels_data['value'],
         nicotine_levels_data['unit']
     )
-    
+
     cursor.execute(query, params)
+    print(f"Inserted nicotine level '{nicotine_levels_data['value']}' for product_id {nicotine_levels_data['product_id']}")
 
 
 def insert_ecig_images(cursor, images_data):
@@ -675,10 +1018,10 @@ def insert_ecig_images(cursor, images_data):
     
     cursor.execute(check_query, (images_data['product_id'], images_data['path']))
     existing_row = cursor.fetchone()
-    
+
     if existing_row:
         # Record already exists, add its ID to the list
-        return
+        return False
     query = """
         INSERT INTO ecig_images (
             product_id, url, path, title, alt_text
@@ -687,7 +1030,7 @@ def insert_ecig_images(cursor, images_data):
             ?, ?, ?, ?, ?
         );
     """
-    
+
     # Convert dictionary to tuple in the correct order
     params = (
         images_data['product_id'],
@@ -697,9 +1040,60 @@ def insert_ecig_images(cursor, images_data):
         images_data['alt_text']
     )
 
-    
-    
+
+
     cursor.execute(query, params)
+    print(f"Inserted image '{images_data['path']}' for product_id {images_data['product_id']}")
+    return True
+
+
+def insert_product_images(product_id, images):
+    """Persist downloaded image records for an existing product."""
+    connection = None
+    cursor = None
+    try:
+        connection = connect()
+        cursor = connection.cursor()
+        inserted = 0
+        for image in images or []:
+            if insert_ecig_images(cursor, {
+                'product_id': product_id,
+                'url': image.get('url'),
+                'path': image.get('path'),
+                'title': image.get('title'),
+                'alt_text': image.get('alt'),
+            }):
+                inserted += 1
+        connection.commit()
+        return inserted
+    except Exception as error:
+        print(f"Azure image update Error: {error}")
+        if connection:
+            connection.rollback()
+        return 0
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+def product_has_images(product_id):
+    connection = None
+    cursor = None
+    try:
+        connection = connect()
+        cursor = connection.cursor()
+        cursor.execute("SELECT TOP 1 id FROM ecig_images WHERE product_id = ?", (product_id,))
+        return cursor.fetchone() is not None
+    except Exception as error:
+        print(f"Azure image lookup Error for product_id {product_id}: {error}")
+        return False
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 def get_product_reviews():
@@ -711,7 +1105,7 @@ def get_product_reviews():
         # The SQL query with a parameter placeholder for site_name
         query = """select p.site_tag, p.site_name,
 r.id, r.product_id, r.review_date , r.review_text, r.sweet_level, r.iced_level, 
-r.rating
+r.rating, r.verified, r.date_inserted
 from 
 ecig_reviews r
 inner join ecig_product p on

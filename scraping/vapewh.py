@@ -10,7 +10,7 @@ import sys
 import os
 import traceback
 
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import InvalidSessionIdException, NoSuchElementException, TimeoutException
 
 import json
 from datetime import datetime, timedelta
@@ -36,29 +36,30 @@ company = VAPE_WH
 
 
 links = [
-
-    "/collections/all-disposable-e-cigs",
-    "/collections/3-nicotine-disposable-vapes",
-    "/collections/smart-vapes",
-    "/collections/all-lower-nicotine-vapes",
-    "/collections/vapes-with-battery-indicators",
-    "/collections/again-u-bar",
-    "/collections/lost-mary",
-    "/collections/raz",
-    "/collections/realio",
-    "/collections/e-liquid",
-    "/collections/sub-ohm",
-    "/collections/nicotine-salt",
-    "/collections/all-hardware",
-    "/collections/mods-kits",
-    "/collections/tanks-coils",
-    "/collections/replacement-pods",
-    "/collections/nicotine-pouches",
-    "/collections/nicotine-pouches/products/lolo-pouches",
-    "/collections/nicotine-pouches/products/thursday-pouches",
-    "/collections/vape-deals",
-    "/collections/newest-arrivals",
-    "/collections/all"
+    # Current WordPress/WooCommerce category and brand paths from the menu.
+    "/product-category/deals/",
+    "/product-category/all-disposable-e-cigs/",
+    "/product-category/3-nicotine-disposable-vapes/",
+    "/product-category/newest-arrivals/",
+    "/product-category/smart-vapes/",
+    "/product-category/liquid-visible/",
+    "/product-category/all-lower-nicotine-vapes/",
+    "/brand/geek-bar/",
+    "/brand/lost-mary/",
+    "/brand/raz-vapes/",
+    "/brand/realio-vapes/",
+    "/brand/off-stamp/",
+    "/brand/ijoy/",
+    "/brand/dinner-lady/",
+    "/brand/oxbar/",
+    "/brand/juul/",
+    "/product-category/e-liquid/",
+    "/product-category/sub-ohm/",
+    "/product-category/all-hardware/",
+    "/product-category/mods-kits/",
+    "/product-category/tanks-coils/",
+    "/product-category/nicotine-salt/",
+    "/product-category/replacement-pods/",
 ]
 
 print('TOTAL LINKS', len(links))
@@ -249,16 +250,37 @@ def get_reviews(psoup):
                     reviews.append(ri_info)
     return reviews
 
-def get_html(url, clicked=False, closed=False, elements=True, load_more=False):
 
-    driver = None
+def download_product_images(soup, tag, site_dir, referer=None, driver=None):
+    candidates = []
+    seen = set()
+    cookies = {cookie['name']: cookie['value'] for cookie in driver.get_cookies()} if driver else None
+    for image in soup.select('.productView-images img, .woocommerce-product-gallery img, img.wp-post-image'):
+        url = image.get('data-large_image') or image.get('data-src') or image.get('src')
+        if not url or url in seen or url.startswith('data:'):
+            continue
+        seen.add(url)
+        candidates.append({'url': url, 'alt': image.get('alt', '')})
+    return download_image_batch(
+        candidates, tag, site_dir, referer=referer or BASE, cookies=cookies
+    )
+
+
+def create_driver():
+    options = Options()
+    if os.environ.get("HEADLESS", "1").lower() not in {"0", "false", "no"}:
+        options.add_argument('--headless')
+    return webdriver.Firefox(options=options)
+
+def get_html(url, clicked=False, closed=False, elements=True, load_more=False, driver=None):
+
+    owns_driver = driver is None
     try:
-        options = Options()
-        options.add_argument('--headless')  # Enable headless mode properly
-
-        # Start the WebDriver in headless mode
-        driver = webdriver.Firefox(options=options)
+        if owns_driver:
+            driver = create_driver()
         driver.get(url)
+        if not driver.find_elements(By.TAG_NAME, "body"):
+            raise RuntimeError("Vape WH returned no document body")
         last_n = 0
         hrefs = set()
         button_id = 'ac-ag-yes-button'
@@ -271,8 +293,23 @@ def get_html(url, clicked=False, closed=False, elements=True, load_more=False):
         # wait.until(EC.visibility_of_element_located((By.CLASS_NAME, "modal-content")))
 
         if not clicked:
-            button = driver.find_element(By.ID, "ac-ag-yes-button")
-            button.click()
+            # The age gate is optional. Its absence is normal after the site
+            # cookie is set, and must not turn a valid page into empty HTML.
+            for locator in (
+                (By.ID, "ac-ag-yes-button"),
+                (By.CLASS_NAME, "age-yes"),
+                (By.XPATH, "//button[normalize-space()='Yes']"),
+                (By.XPATH, "//button[contains(translate(., 'YESIAM', 'yesiam'), 'yes')]") ,
+            ):
+                try:
+                    button = WebDriverWait(driver, 2).until(
+                        EC.element_to_be_clickable(locator)
+                    )
+                    button.click()
+                    time.sleep(1)
+                    break
+                except (TimeoutException, NoSuchElementException):
+                    continue
 
         if not closed:
             wait = WebDriverWait(driver, 10)  # wait up to 10 seconds
@@ -287,7 +324,9 @@ def get_html(url, clicked=False, closed=False, elements=True, load_more=False):
                 button.click()
                 #print("Button clicked.")
             except TimeoutException:
-                print("Button not found or not clickable.")
+                # The promotion is optional; absence means there is nothing
+                # to dismiss and should not look like a scraper failure.
+                pass
 
         # Set a delay for dynamic content loading
         SCROLL_PAUSE_TIME = 1  # Shorter pause for smoother scroll
@@ -342,13 +381,26 @@ def get_html(url, clicked=False, closed=False, elements=True, load_more=False):
         html = driver.page_source
 
     except Exception as ex:
+        # A browser session can disappear during a long run.  Do not query
+        # page_source again here: doing so raises InvalidSessionIdException
+        # and hides the original failure from the caller.
         print(ex)
+        if isinstance(ex, InvalidSessionIdException):
+            raise
         html = ''
-    finally:
         if driver:
-            driver.close()
+            try:
+                html = driver.page_source or ''
+            except Exception:
+                html = ''
+    finally:
+        if driver and owns_driver:
+            try:
+                html = driver.page_source or html
+            except Exception:
+                pass
+            driver.quit()
     time.sleep(3)
-
 
     return html
 
@@ -362,88 +414,177 @@ def main():
     
     has_header = False
     
-
-    for top_level_link in links:
+    driver = create_driver()
+    try:
+        homepage = requests.get(BASE, timeout=45)
+        discovered = discover_catalog_links(
+            homepage.text,
+            BASE,
+            prefixes=("/product-category/", "/brand/"),
+            exclude=("/cart", "/my-account", "/search", "/blog", "/about", "/contact"),
+        )
+        scrape_links = list(dict.fromkeys(links + discovered))
+        print(f"Discovered {len(discovered)} Vape WH catalog links; using {len(scrape_links)} total")
+        section_links = list(prioritize_links(scrape_links))
+        if not section_links:
+            print("No Vape WH catalog links available")
+            return
+        section_index = 0
+        top_level_link = section_links[section_index]
         page = 1
-        site_section = top_level_link.split('/')[2]  # Extract section name
+        site_section = normalize_site_category(top_level_link)
+        seen_page_signatures = set()
 
-
-        while True:
+        while section_index < len(section_links):
             url = f'{BASE}{top_level_link}?page={page}'
             print(url)
 
             if url in found:
                 reqtxt = found[url]
             else:
-                reqtxt = get_html(url)
+                try:
+                    reqtxt = get_html(url, driver=driver)
+                except InvalidSessionIdException:
+                    print(f"WebDriver session failed while loading {url}; restarting browser once")
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    driver = create_driver()
+                    reqtxt = get_html(url, driver=driver)
                 found[url] = reqtxt
             #reqtxt = get_html(url)
             soup = BeautifulSoup(reqtxt, features="lxml")
-            products = soup.find_all('product-card')
+            products = soup.select(
+                'product-card, .product-card, .pcard-plp, '
+                '[data-product-card], [data-product-id], '
+                'li.product, .woocommerce ul.products li.product, '
+                '.products.columns-4 > li, .products.columns-3 > li, '
+                '.category-section-grid .products-section-card'
+            )
             print(url, len(products))
+            if not products and len(reqtxt) < 1000:
+                print(f"Vape WH returned an empty/blocked page ({len(reqtxt)} bytes): {url}")
             
             if len(products) == 0:
-                break
-            page += 1
+                section_index += 1
+                if section_index >= len(section_links):
+                    break
+                top_level_link = section_links[section_index]
+                site_section = normalize_site_category(top_level_link)
+                page = 1
+                seen_page_signatures = set()
+                continue
 
-            if page > 20:
-                print('TOO MANY PAGES, BREAKING')
-                break
+            page_signature = tuple(
+                sorted(
+                    (product.select_one("a[href]") or {}).get("href", "")
+                    for product in products
+                )
+            )
+            if page_signature in seen_page_signatures:
+                print(f"Repeated product page detected for {top_level_link}; moving to next section")
+                section_index += 1
+                if section_index >= len(section_links):
+                    break
+                top_level_link = section_links[section_index]
+                site_section = normalize_site_category(top_level_link)
+                page = 1
+                seen_page_signatures = set()
+                continue
+            seen_page_signatures.add(page_signature)
+
+            if page > 100:
+                print('PAGE LIMIT REACHED, BREAKING SECTION')
+                section_index += 1
+                if section_index >= len(section_links):
+                    break
+                top_level_link = section_links[section_index]
+                site_section = normalize_site_category(top_level_link)
+                page = 1
+                seen_page_signatures = set()
+                continue
+            page += 1
 
             for product in products:
                 if not isinstance(product, element.Tag):
                     continue
 
                 # Title
-                title = product.select_one(".product-card__title").get_text(strip=True)
+                title_node = product.select_one(
+                    ".product-card__title, .product-title, "
+                    ".woocommerce-loop-product__title, h2.woocommerce-loop-product__title, "
+                    ".products-section-card-description"
+                )
+                if not title_node:
+                    continue
+                title = title_node.get_text(strip=True)
 
                 # Product URL
-                product_link = product.select_one(".product-card__title")
+                product_link = product.select_one(
+                    ".product-card__title[href], .product-title[href], "
+                    "a[href*='/products/'], a.woocommerce-LoopProduct-link, "
+                    "a[href*='/product/'], .products-section-card-image[href], "
+                    ".products-section-card-button[href], [data-product-url]"
+                )
                 if product_link:
-                    product_url_path = product_link.get('href')
-                    full_link = f'{BASE}{product_url_path}'
-                    tag = product_url_path.split('/')[-1].split('?')[0]
+                    product_url_path = product_link.get('href') or product_link.get('data-product-url')
+                else:
+                    continue
+                full_link = requests.compat.urljoin(BASE, product_url_path)
+                tag = product_url_path.rstrip('/').split('/')[-1].split('?')[0]
 
                 print(full_link)
 
                 if full_link in found:
                     product_html = found[full_link]
                 else:
-                    product_html = get_html(full_link)
+                    try:
+                        product_html = get_html(full_link, driver=driver)
+                    except InvalidSessionIdException:
+                        print(f"WebDriver session failed while loading {full_link}; restarting browser once")
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        driver = create_driver()
+                        product_html = get_html(full_link, driver=driver)
                     found[full_link] = product_html
 
                 psoup = BeautifulSoup(product_html, features="lxml")
                 txt = psoup.get_text()
 
-                product_id = get_product_id(company, tag)
-                if product_id:
-                    print('EXISTS', tag)
-                    reviews = get_reviews(psoup)
-                    insert_reviews(reviews, product_id)
-                    continue
+                # Prices
+                sale_node = product.select_one(".price-item--sale, .price--sale")
+                regular_node = product.select_one(
+                    ".price-item--compare, .price-item--regular, .price--regular, .price, "
+                    ".products-section-card-price .woocommerce-Price-amount"
+                )
+                sale_price_str = sale_node.get_text(strip=True) if sale_node else None
+                reg_price_str = regular_node.get_text(strip=True) if regular_node else None
 
+                product_id = get_product_id(company, tag)
+                print(f"PRODUCT {title} [{tag}]")
+                print(f"{'EXISTS' if product_id else 'NEW'} {tag}; parsing current product metadata")
 
                 # Rating & votes
                 rating_tag = product.select_one(".loox-rating")
-                rating = rating_tag.get("data-rating")
-                votes = rating_tag.get("data-raters")
+                rating = rating_tag.get("data-rating") if rating_tag else None
+                votes = rating_tag.get("data-raters") if rating_tag else None
 
-                # Prices
-                sale_price_str = product.select_one(".price-item--sale").get_text(strip=True)
-                reg_price_str = product.select_one(".price-item--compare").get_text(strip=True)
 
                 # Images
                 image_list = []
                 
                 # Find all <img> tags
                 for img in product.find_all("img"):
-                    img_url = img.get("src")
+                    img_url = img.get("data-src") or img.get("src")
                     if not img_url:
                         continue
                     if img_url.startswith('//'):
                         img_url = 'https:' + img_url
                     img_alt = img.get("alt", "").strip()
-                    if url:
+                    if img_url:
                         image_list.append({"url": img_url, "alt": img_alt})
 
                 valid_image_list = []
@@ -451,13 +592,24 @@ def main():
                 for i in image_list:
                     img_n += 1
                     img_path = f'{tag}_{img_n}'
-                    img = download_image(i['url'], img_path, save_dir=f'data_from_sites_v2/{company}_images', alt=i['alt'])
+                    img = download_image(
+                        i['url'],
+                        img_path,
+                        save_dir=f'data_from_sites_v2/{company}_images',
+                        alt=i['alt'],
+                        referer=full_link,
+                        cookies={cookie['name']: cookie['value'] for cookie in driver.get_cookies()},
+                    )
                     if img:
                         valid_image_list.append(img)
+                print(f'Downloaded {len(valid_image_list)}/{len(image_list)} images for {tag}')
 
 
 
-                main_element = psoup.find("main", {"id": "MainContent"})
+                # WooCommerce product pages do not always use Shopify's
+                # MainContent wrapper. Use the full document as a safe
+                # fallback so a missing wrapper does not abort the product.
+                main_element = psoup.find("main", {"id": "MainContent"}) or psoup
                 flavor_list = extract_options_generic(main_element, ["flavor", "flavours", "flavour", "flavors", "flavor profile", "taste", "taste profile", "choose your flavor", "choose your flavour", "flavor options", "flavour options", "flavor selection", "flavour selection", "available flavors", "available flavours", "flavor choices", "flavour choices", "flavor selection", "flavour selection"])
                 colors = extract_options_generic(main_element, ["colors", "color", "choose your color", "choose your colours", "color options", "colour options", "color selection", "colour selection", "available colors", "available colours", "color choices", "colour choices", "available color", "available colour", "color variants", "colour variants", "color variations", "colour variations"])
                 nicotine_strengths_ = extract_options_generic(main_element, ["nicotine strength", "nicotine strengths", "nicotine level", "nicotine levels", "nicotine content", "nicotine contents", "nicotine options", "nicotine selection", "nicotine choices", "nicotine variants", "nicotine variations"])
@@ -544,10 +696,22 @@ def main():
                 product_data['usb_bool'] = usb
                 product_data['adjustable_bool'] = adjustable
                 
-                print('MAP PRODUCT DATA', top_level_link, )
-                map_product_data(company, product_data)
+                if product_id:
+                    sync_ecig_product_history(product_id, product_data)
+                    update_ecig_product_metadata(product_id, stable_sku(company, tag), product_data['stock_status'])
+                    insert_reviews(reviews, product_id)
+                    insert_ecig_price(product_id, reg_price_str, sale_price_str)
+                else:
+                    print('MAP PRODUCT DATA', top_level_link)
+                    map_product_data(company, product_data)
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            # The browser may already have exited after a WebDriver failure.
+            pass
 
 if __name__ == "__main__":
-
     print('get new products')
     main()

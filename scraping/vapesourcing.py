@@ -36,7 +36,7 @@ company = VAPE_SOURCING
 
 links = [
     # Disposables
-      '/disposable-pod.html',
+      '/disposable-vapes.html',
     "/cotton-candy-disposable-vape.html",
     "/fruit-flavor-disposable-vape.html",
     "/dessert-flavor-disposable-vape.html",
@@ -278,12 +278,20 @@ if __name__ == "__main__":
     
     has_header = False
     
-
-    for top_level_link in links:
+    homepage = requests.get(BASE, timeout=45)
+    discovered = discover_catalog_links(
+        homepage.text,
+        BASE,
+        prefixes=("/",),
+        exclude=("/cart", "/checkout", "/customer", "/catalogsearch", "/blog", "/author", "/review"),
+    )
+    scrape_links = list(dict.fromkeys(links + discovered))
+    print(f"Discovered {len(discovered)} VapeSourcing catalog links; using {len(scrape_links)} total")
+    for top_level_link in prioritize_links(scrape_links):
         if not top_level_link.startswith('/'):
             continue
         page = 1
-        site_section = top_level_link.split('/')[1].replace('.html', '')  # Extract section name
+        site_section = normalize_site_category(top_level_link)
 
 
         while True:
@@ -329,15 +337,12 @@ if __name__ == "__main__":
 
                 full_link = product_url if product_url.startswith('http') else BASE + product_url
                 tag = product_url.split('/')[-1].replace('.html', '').strip()  
-
-
                 
                 price_obj = p.select_one('.special-price .price')
                 if price_obj:
                     price = price_obj.get_text(strip=True)
                 else:
                     price = ''
-
 
 
                 if full_link in found:
@@ -350,10 +355,7 @@ if __name__ == "__main__":
 
                 product_id = get_product_id(company, tag)
                 if product_id:
-                    print('EXISTS', tag)
-                    reviews = get_reviews(psoup)
-                    insert_reviews(reviews, product_id)
-                    continue 
+                    print('EXISTS', tag, '; checking product history, price history, and images')
 
                 product_main = psoup.find('div', class_='product-main')
                 osoup = psoup.find('div', class_='product-options')
@@ -450,12 +452,15 @@ if __name__ == "__main__":
                 
                 valid_image_list = []
                 img_n = 0
-                for i in images:
-                    img_n += 1
-                    img_path = f'{tag}_{img_n}'
-                    img = download_image(i, img_path, save_dir=f'data_from_sites_v2/{company}_images', alt=product_name)
-                    if img:
-                        valid_image_list.append(img)
+                should_download_images = not product_id or not product_has_images(product_id)
+                if should_download_images:
+                    for i in images:
+                        img_n += 1
+                        img_path = f'{tag}_{img_n}'
+                        valid_image_list.extend(download_image_batch([{'url': i, 'alt': product_name}], img_path, f'data_from_sites_v2/{company}_images'))
+                    print(f'Downloaded {len(valid_image_list)}/{img_n} images for {tag}')
+                else:
+                    print(f"IMAGES EXIST for product_id {product_id}; skipping image download")
 
                 reviews = get_reviews(psoup)
                 
@@ -510,5 +515,13 @@ if __name__ == "__main__":
                 product_data['usb_bool'] = usb
                 product_data['adjustable_bool'] = adjustable
                 
-                print('MAP PRODUCT DATA', product_name, top_level_link, )
-                map_product_data(VAPE_SOURCING, product_data)
+                if product_id:
+                    sync_ecig_product_history(product_id, product_data)
+                    update_ecig_product_metadata(product_id, stable_sku(company, tag), product_data['stock_status'])
+                    if valid_image_list:
+                        insert_product_images(product_id, valid_image_list)
+                    insert_reviews(reviews, product_id)
+                    insert_ecig_price(product_id, price, None)
+                else:
+                    print('MAP PRODUCT DATA', product_name, top_level_link)
+                    map_product_data(VAPE_SOURCING, product_data)
